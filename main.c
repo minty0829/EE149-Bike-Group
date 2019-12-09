@@ -4,6 +4,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <math.h>
+#include "app_error.h"
+#include "nrf_sdh.h"
+#include "nrfx_gpiote.h"
 #include "nrf.h"
 #include "app_util.h"
 #include "nrf_twi_mngr.h"
@@ -11,6 +16,9 @@
 #include "display.h"
 #include "nrf_delay.h"
 #include "states.h"
+#include "nrf_serial.h"
+
+#include "nrf_pwr_mgmt.h"
 
 #include "simple_ble.h"
 #include "buckler.h"
@@ -20,10 +28,10 @@
 
 // I2C manager
 NRF_TWI_MNGR_DEF(twi_mngr_instance, 5, 0);
+static uint8_t MPU_ADDRESS = 0x68;
+
 // Enable SoftDevice (used to get RTC running)
-nrf_sdh_enable_request();
-
-
+// nrf_sdh_enable_request();
 
 
 // Intervals for advertising and connections
@@ -96,25 +104,22 @@ int main(void) {
   printf("MPU9250 initialized\n");
   // Initialize
 
-  // initialize display
-  nrf_drv_spi_t spi_instance = NRF_DRV_SPI_INSTANCE(1);
-  nrf_drv_spi_config_t spi_config = {
-    .sck_pin = BUCKLER_LCD_SCLK,
-    .mosi_pin = BUCKLER_LCD_MOSI,
-    .miso_pin = BUCKLER_LCD_MISO,
-    .ss_pin = BUCKLER_LCD_CS,
-    .irq_priority = NRFX_SPI_DEFAULT_CONFIG_IRQ_PRIORITY,
-    .orc = 0,
-    .frequency = NRF_DRV_SPI_FREQ_4M,
-    .mode = NRF_DRV_SPI_MODE_2,
-    .bit_order = NRF_DRV_SPI_BIT_ORDER_MSB_FIRST
-  };
+  //initialize wom interrupt
+// i2c_reg_write(MPU_ADDRESS, MPU9250_PWR_MGMT_1, i2c_reg_read(MPU_ADDRESS, MPU9250_PWR_MGMT_1) | 0x00);
+  i2c_reg_write(MPU_ADDRESS, MPU9250_PWR_MGMT_2, i2c_reg_read(MPU_ADDRESS, MPU9250_PWR_MGMT_2) | 0x07);
+  i2c_reg_write(MPU_ADDRESS, 0x1D, 0x0C); //ACCEL_CONFIG 2
+  i2c_reg_write(MPU_ADDRESS, 0x38, 0x40); //INT_ENABLE
+  i2c_reg_write(MPU_ADDRESS, 0x69, 0xC0); //MOT_DETECT_CTRL
+  i2c_reg_write(MPU_ADDRESS, 0x1F, 0x18); //WOM_THR
+  i2c_reg_write(MPU_ADDRESS, 0x1E, 0x07); //LP_ACCEL_ODR
+  i2c_reg_write(MPU_ADDRESS, MPU9250_PWR_MGMT_1, i2c_reg_read(MPU_ADDRESS, MPU9250_PWR_MGMT_1) | 0x20); //PWR_MGMT_1
 
-  error_code = nrf_drv_spi_init(&spi_instance, &spi_config, NULL, NULL);
-  APP_ERROR_CHECK(error_code);
-  display_init(&spi_instance);
-  display_write("Hello, Human!", DISPLAY_LINE_0);
-  printf("Display initialized!\n");
+  // NRF_GPIOTE->CONFIG[0] |= 0x20701; 
+  // NRF_GPIOTE->INTENSET |= 0x1;
+
+  // NVIC_EnableIRQ(GPIOTE_IRQn);
+
+  nrf_gpio_cfg_sense_input(7, NRF_GPIO_PIN_PULLDOWN , NRF_GPIO_PIN_SENSE_HIGH );
 
   // Setup LED GPIO
   nrf_gpio_cfg_output(BUCKLER_LED0);
@@ -135,47 +140,62 @@ int main(void) {
       &led_service, &lcd_state_char);
 
   // Start Advertising
-  simple_ble_adv_only_name();
+  //simple_ble_adv_only_name();
   float y = 0;
   float x = 0;
+  float prev_y = 0;
+  float prev_x = 0;
+  int idle_timer = 0;
+  bool idling = false;
   while(1) {
     y = mpu9250_read_accelerometer().y_axis;
     x = mpu9250_read_accelerometer().x_axis;
-    if (tilt_begin && y < 0.2 && y > -.2) {
-      state = ACTIVE;
-    } else if (y > 0.2 || y < -0.2) {
-      tilt_begin = true;
-    }
-
-    if (x < -0.1) {
-      brake_state = BRAKE;
+    if (idling) {
+      printf("Just chillin");
+      idle_timer = 0;
+      sd_power_system_off();
+      idling = false;
     } else {
-      brake_state = NOT_BRAKE;
-    }
+      printf("%d\n", idle_timer);
+      if (abs(x - prev_x) < .2) {
+        idle_timer = idle_timer + 1;
+        if (idle_timer > 10) {
+          idling = true;
+        }
+      } 
+      if (tilt_begin && y < 0.2 && y > -.2) {
+        state = ACTIVE;
+      } else if (y > 0.2 || y < -0.2) {
+        tilt_begin = true;
+      }
 
-    if (brake_state == BRAKE) {
-      printf ("Braking\n");
-      nrf_gpio_pin_clear(BUCKLER_LED2);
-    } else {
-      nrf_gpio_pin_set(BUCKLER_LED2);
-    }
+      if (x < -0.1) {
+        brake_state = BRAKE;
+      } else {
+        brake_state = NOT_BRAKE;
+      }
 
-    if (state == LEFT) {
+      if (brake_state == BRAKE) {
+        printf ("Braking\n");
+        nrf_gpio_pin_clear(BUCKLER_LED2);
+      } else {
+        nrf_gpio_pin_set(BUCKLER_LED2);
+      }
 
-      printf("Making a left turn!\n");
-      nrf_gpio_pin_toggle(BUCKLER_LED0);
-      nrf_delay_ms(500);
-    } else if (state == RIGHT) {
-      printf("Making a right turn!\n");
-        nrf_gpio_pin_toggle(BUCKLER_LED1);
-        nrf_delay_ms(500);
-    }else {
-      nrf_gpio_pin_set(BUCKLER_LED0);
-      nrf_gpio_pin_set(BUCKLER_LED1);
-      nrf_delay_ms(500);
+      if (state == LEFT) {
+        printf("Making a left turn!\n");
+        nrf_gpio_pin_toggle(BUCKLER_LED0);
+      } else if (state == RIGHT) {
+        printf("Making a right turn!\n");
+          nrf_gpio_pin_toggle(BUCKLER_LED1);
+      }else {
+        nrf_gpio_pin_set(BUCKLER_LED0);
+        nrf_gpio_pin_set(BUCKLER_LED1);
+      }
+      printf("Reading (accel): %f\n", y); 
     }
-    
-    printf("Reading (accel): %f\n", y);
+    prev_y =  y;
+    prev_x = x;
+    nrf_delay_ms(1000);
   }
 }
-
