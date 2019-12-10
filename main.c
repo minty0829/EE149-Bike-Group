@@ -1,6 +1,7 @@
 // BLE Service Template
 //
 // Creates a service for changing LED state over BLE
+#define NO_VTOR_CONFIG
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,10 +19,15 @@
 #include "states.h"
 #include "nrf_serial.h"
 
+#include "nrf_log.h"
+#include "nrf_log_ctrl.h"
+#include "nrf_log_default_backends.h"
+
 #include "nrf_pwr_mgmt.h"
 
 #include "simple_ble.h"
 #include "buckler.h"
+#include "simple_logger.h"
 
 #include "max44009.h"
 #include "mpu9250.h"
@@ -30,8 +36,7 @@
 NRF_TWI_MNGR_DEF(twi_mngr_instance, 5, 0);
 static uint8_t MPU_ADDRESS = 0x68;
 
-// Enable SoftDevice (used to get RTC running)
-// nrf_sdh_enable_request();
+
 
 
 // Intervals for advertising and connections
@@ -92,6 +97,36 @@ void ble_evt_write(ble_evt_t const* p_ble_evt) {
 int main(void) {
   ret_code_t error_code = NRF_SUCCESS;
 
+  // Enable SoftDevice (used to get RTC running)
+  //nrf_sdh_enable_request();
+
+  // Setup BLE
+  // IMPORTANT: MUST BE BEFORE simple_logger_init TO WORK!!!!!!!!!
+  // see simple_ble.c ble_stack_init: nrf_sdh_enable_request is called there and if already called errors
+  simple_ble_app = simple_ble_init(&ble_config);
+
+  simple_ble_add_service(&led_service);
+
+  simple_ble_add_characteristic(1, 1, 0, 0,
+      sizeof(led_state), (uint8_t*)&led_state,
+      &led_service, &led_state_char);
+
+  simple_ble_add_characteristic(1, 1, 0, 1,
+      sizeof(lcd_state), lcd_state,
+      &led_service, &lcd_state_char);
+
+  // Start Advertising
+  simple_ble_adv_only_name();
+
+  // Initialize GPIO driver
+  if (!nrfx_gpiote_is_init()) {
+    error_code = nrfx_gpiote_init();
+  }
+  // initialize RTT library
+  error_code = NRF_LOG_INIT(NULL);
+  APP_ERROR_CHECK(error_code);
+  NRF_LOG_DEFAULT_BACKENDS_INIT();
+  printf("Log initialized\n");
 
   // initialize i2c master (two wire interface)
   nrf_drv_twi_config_t i2c_config = NRF_DRV_TWI_DEFAULT_CONFIG;
@@ -103,6 +138,30 @@ int main(void) {
   mpu9250_init(&twi_mngr_instance);
   printf("MPU9250 initialized\n");
   // Initialize
+
+  // configure sd card gpios
+  nrf_gpio_cfg_output(BUCKLER_SD_ENABLE);
+  nrf_gpio_cfg_output(BUCKLER_SD_CS);
+  nrf_gpio_cfg_output(BUCKLER_SD_MOSI);
+  nrf_gpio_cfg_output(BUCKLER_SD_SCLK);
+  nrf_gpio_cfg_input(BUCKLER_SD_MISO, NRF_GPIO_PIN_NOPULL);
+
+  nrf_gpio_pin_set(BUCKLER_SD_ENABLE);
+  nrf_gpio_pin_set(BUCKLER_SD_CS);
+
+  // // Initialize SD card
+  const char filename[] = "testfile.log";
+  const char permissions[] = "a"; // w = write, a = append
+
+  // Start file
+  simple_logger_init(filename, permissions);
+
+  // If no header, add it
+  simple_logger_log_header("HEADER for file \'%s\', written on %s \n", filename, "12/10/2019");
+  printf("Wrote header to SD card\n");
+
+  
+
 
   //initialize wom interrupt
 // i2c_reg_write(MPU_ADDRESS, MPU9250_PWR_MGMT_1, i2c_reg_read(MPU_ADDRESS, MPU9250_PWR_MGMT_1) | 0x00);
@@ -120,27 +179,13 @@ int main(void) {
   // NVIC_EnableIRQ(GPIOTE_IRQn);
 
   nrf_gpio_cfg_sense_input(7, NRF_GPIO_PIN_PULLDOWN , NRF_GPIO_PIN_SENSE_HIGH );
-
+ 
   // Setup LED GPIO
   nrf_gpio_cfg_output(BUCKLER_LED0);
   nrf_gpio_cfg_output(BUCKLER_LED1);
   nrf_gpio_cfg_output(BUCKLER_LED2);
 
-  // Setup BLE
-  simple_ble_app = simple_ble_init(&ble_config);
-
-  simple_ble_add_service(&led_service);
-
-  simple_ble_add_characteristic(1, 1, 0, 0,
-      sizeof(led_state), (uint8_t*)&led_state,
-      &led_service, &led_state_char);
-
-  simple_ble_add_characteristic(1, 1, 0, 1,
-      sizeof(lcd_state), lcd_state,
-      &led_service, &lcd_state_char);
-
-  // Start Advertising
-  //simple_ble_adv_only_name();
+  
   float y = 0;
   float x = 0;
   float prev_y = 0;
@@ -150,6 +195,7 @@ int main(void) {
   while(1) {
     y = mpu9250_read_accelerometer().y_axis;
     x = mpu9250_read_accelerometer().x_axis;
+    simple_logger_log("%f\n", x);
     if (idling) {
       printf("Just chillin");
       idle_timer = 0;
@@ -157,12 +203,17 @@ int main(void) {
       idling = false;
     } else {
       printf("%d\n", idle_timer);
-      if (abs(x - prev_x) < .2) {
+      printf("%f\n", prev_x);
+      printf("%f\n", x);
+      printf("%f\n", fabs(x - prev_x));
+      if (fabs(x - prev_x) < .2) {
         idle_timer = idle_timer + 1;
         if (idle_timer > 10) {
           idling = true;
         }
-      } 
+      }  else {
+        idle_timer = 0;
+      }
       if (tilt_begin && y < 0.2 && y > -.2) {
         state = ACTIVE;
       } else if (y > 0.2 || y < -0.2) {
@@ -196,6 +247,6 @@ int main(void) {
     }
     prev_y =  y;
     prev_x = x;
-    nrf_delay_ms(1000);
+    nrf_delay_ms(500);
   }
 }
