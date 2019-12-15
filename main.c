@@ -36,7 +36,13 @@
 NRF_TWI_MNGR_DEF(twi_mngr_instance, 5, 0);
 static uint8_t MPU_ADDRESS = 0x68;
 
+// I2S stuff for WS2812
+#define NLEDS 10
+#define RESET_BITS 6
+#define I2S_BUFFER_SIZE 3*NLEDS + RESET_BITS
 
+static uint32_t m_buffer_tx[I2S_BUFFER_SIZE];
+static volatile int nled = 1;
 
 
 // Intervals for advertising and connections
@@ -61,6 +67,14 @@ static simple_ble_char_t lcd_state_char = {.uuid16 = 0x1091};
 static uint8_t led_state = 0;
 static uint8_t lcd_state[185];
 // memset(lcd_state, (uint8_t)0, 185);
+
+static void i2s_handler(uint32_t const* p_data_received,uint32_t* p_data_to_send, uint16_t number_of_words)
+{
+    if (p_data_to_send != NULL)
+    {
+        // no-op
+    }
+}
 
 /*******************************************************************************
  *   State for this application
@@ -93,6 +107,79 @@ void ble_evt_write(ble_evt_t const* p_ble_evt) {
     }
 }
 
+uint32_t ws2812convert(uint8_t level)
+{
+    uint32_t val = 0;
+
+    // 0 
+    if(level == 0) {
+        val = 0x88888888;
+    }
+    // 255
+    else if (level == 255) {
+        val = 0xeeeeeeee;
+    }
+    else {
+        // apply 4-bit 0xe HIGH pattern wherever level bits are 1.
+        val = 0x88888888;
+        for (uint8_t i = 0; i < 8; i++) {
+            if((1 << i) & level) {
+                uint32_t mask = ~(0x0f << 4*i);
+                uint32_t patt = (0x0e << 4*i);
+                val = (val & mask) | patt;
+            }
+        }
+
+        // swap 16 bits
+        val = (val >> 16) | (val << 16);
+    }
+
+    return val;
+}
+
+void set_led_data()
+{
+    for(int i = 0; i < 3*NLEDS; i += 3) {
+        if (i == 3*nled) {
+            switch(g_demo_mode) 
+            {
+                case 0:
+                {
+                    m_buffer_tx[i] = 0x88888888;
+                    m_buffer_tx[i+1] = ws2812convert(128);
+                    m_buffer_tx[i+2] = 0x88888888;
+                }
+                break;
+                case 1:
+                {
+                    m_buffer_tx[i] = ws2812convert(128);;
+                    m_buffer_tx[i+1] = 0x88888888;
+                    m_buffer_tx[i+2] = 0x88888888;
+                }
+                break;
+                case 2:
+                {
+                    m_buffer_tx[i] = 0x88888888;
+                    m_buffer_tx[i+1] = 0x88888888;
+                    m_buffer_tx[i+2] = ws2812convert(128);
+                }
+                break;
+                default:
+                break;
+            }
+        }
+        else {
+            m_buffer_tx[i] = 0x88888888;
+            m_buffer_tx[i+1] = 0x88888888;
+            m_buffer_tx[i+2] = 0x88888888;
+        }
+    }
+
+    // reset 
+    for(int i = 3*NLEDS; i < I2S_BUFFER_SIZE; i++) {
+        m_buffer_tx[i] = 0;
+    }
+}
 
 int main(void) {
   ret_code_t error_code = NRF_SUCCESS;
@@ -184,7 +271,17 @@ int main(void) {
   nrf_gpio_cfg_output(BUCKLER_LED0);
   nrf_gpio_cfg_output(BUCKLER_LED1);
   nrf_gpio_cfg_output(BUCKLER_LED2);
-
+        
+  // Initialize i2s for leds
+  nrf_drv_i2s_config_t config = NRF_DRV_I2S_DEFAULT_CONFIG;
+  config.sdin_pin  = I2S_SDIN_PIN;
+  config.sdout_pin = I2S_SDOUT_PIN;
+  config.mck_setup = NRF_I2S_MCK_32MDIV10;
+  config.ratio     = NRF_I2S_RATIO_32X;
+  config.channels  = NRF_I2S_CHANNELS_STEREO;
+  nrf_drv_i2s_init(&config, i2s_handler);
+  nrf_drv_i2s_start(0, m_buffer_tx, I2S_BUFFER_SIZE, 0);   
+    
   
   float y = 0;
   float x = 0;
@@ -245,6 +342,7 @@ int main(void) {
       }
       printf("Reading (accel): %f\n", y); 
     }
+    set_led_data();
     prev_y =  y;
     prev_x = x;
     nrf_delay_ms(500);
